@@ -48,6 +48,8 @@ cp .env.example .env
 | `ROLE_JA` | 일본인 역할 ID | ✅ |
 | `TRANSLATE_CHANNEL_IDS` | 기본 번역 채널 ID (쉼표 구분) | ✖ |
 | `OPENAI_MODEL` | OpenAI 모델 (기본: `gpt-4o-mini`) | ✖ |
+| `VOICE_TEXT_CHANNEL_ID` | 음성 STT 번역 결과를 전송할 텍스트 채널 ID | ✖ |
+| `VOICE_SILENCE_TIMEOUT` | 발화 종료 판정 묵음 시간(초, 기본: `1.5`) | ✖ |
 
 ### ID 확인 방법
 
@@ -60,9 +62,10 @@ Discord 설정 → 고급 → **개발자 모드** 활성화 후
 
 1. [discord.com/developers/applications](https://discord.com/developers/applications) 접속
 2. **Bot** 탭 → `MESSAGE CONTENT INTENT` **ON**
-3. **OAuth2** → URL Generator → Scopes: `bot`, `applications.commands`
-   Permissions: `Send Messages`, `Read Messages`, `Read Message History`
-4. 생성된 URL로 서버에 봇 초대
+3. **Bot** 탭 → `SERVER MEMBERS INTENT` **ON** (음성 역할 감지용)
+4. **OAuth2** → URL Generator → Scopes: `bot`, `applications.commands`
+   Permissions: `Send Messages`, `Read Messages`, `Read Message History`, `Connect`, `Speak`
+5. 생성된 URL로 서버에 봇 초대
 
 ## 실행
 
@@ -107,6 +110,36 @@ embed로 reply
 
 - **Google 번역**: 빠름, 무료, 반복 메시지 캐싱
 - **AI 번역**: 자연스러운 번역, 뉘앙스 보존, 유료 (gpt-4o-mini 기준 매우 저렴)
+
+## 음성 채널 STT 번역
+
+```
+유저가 음성채널 입장
+    ↓
+봇 자동 입장 + 녹음 시작
+    ↓
+1.5초 묵음 감지 → 해당 발화 구간 추출
+    ↓
+OpenAI Whisper STT (역할 기반 언어 힌트)
+ROLE_JA 유저 → language="ja"
+ROLE_KO 유저 → language="ko"
+    ↓
+AI 번역 (GPT)
+    ↓
+VOICE_TEXT_CHANNEL_ID 채널에 embed 전송
+    ↓
+봇만 남으면 자동 퇴장
+```
+
+### 준비 사항
+
+- `.env`에 `VOICE_TEXT_CHANNEL_ID` 설정 필요
+- Discord Developer Portal에서 `SERVER MEMBERS INTENT` ON 필요
+- 봇 초대 권한에 `Connect`, `Speak` 추가 필요
+
+### 비용
+
+Whisper API: **$0.006 / 분** (1시간 통화 ≈ $0.36)
 
 </details>
 
