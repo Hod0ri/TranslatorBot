@@ -1,7 +1,37 @@
+import asyncio
+import io
+import logging
 import os
+import time
+import wave
+
+try:
+    import audioop
+except ImportError:
+    audioop = None  # Python 3.13+: audioop-lts 패키지로 설치 필요
+
+# voice_recv 내부 로그 레벨 조정 (정상 패킷/복구 가능한 에러는 WARNING으로)
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
+logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.CRITICAL)
+
 import discord
+
+# Opus 라이브러리 로드 (Linux 서버에서 libopus0 패키지 설치 필요)
+if not discord.opus.is_loaded():
+    for _lib in ("opus", "libopus.so.0", "libopus.so", "libopus.0.dylib"):
+        try:
+            discord.opus.load_opus(_lib)
+            break
+        except OSError:
+            continue
+    if not discord.opus.is_loaded():
+        logging.warning(
+            "libopus를 찾을 수 없습니다. 음성 STT가 동작하지 않습니다.\n"
+            "  Ubuntu/Debian: apt-get install -y libopus0\n"
+            "  CentOS/RHEL:   dnf install -y opus"
+        )
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, voice_recv
 from langdetect import detect, LangDetectException
 from dotenv import load_dotenv
 import openai
@@ -15,6 +45,13 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 GUILD_ID       = int(os.getenv("GUILD_ID"))
 ROLE_KO        = int(os.getenv("ROLE_KO"))   # 한국인 역할 ID
 ROLE_JA        = int(os.getenv("ROLE_JA"))   # 일본인 역할 ID
+
+# 음성 STT 설정
+VOICE_TEXT_CHANNEL_ID  = int(os.getenv("VOICE_TEXT_CHANNEL_ID", "0"))
+VOICE_SILENCE_TIMEOUT  = float(os.getenv("VOICE_SILENCE_TIMEOUT", "1.5"))
+# RMS 노이즈 임계값: 이 값 미만이면 노이즈로 판단해 Whisper 호출 생략
+# 16-bit PCM 기준 (max 32767). 조용한 환경 200~300, 잡음 많으면 400~600
+VOICE_NOISE_THRESHOLD  = int(os.getenv("VOICE_NOISE_THRESHOLD", "300"))
 
 # TRANSLATE_CHANNEL_IDS: 쉼표로 구분된 기본 번역 채널 ID 목록
 _channel_ids = os.getenv("TRANSLATE_CHANNEL_IDS", "")
@@ -385,6 +422,204 @@ async def on_message(message: discord.Message):
 
     except Exception as e:
         print(f"[error] {e}")
+
+
+# ── 음성 STT ─────────────────────────────────────────────
+
+# Discord PCM 스펙 (고정값)
+_PCM_RATE  = 48_000
+_PCM_CH    = 2
+_PCM_WIDTH = 2  # bytes (16-bit signed)
+# 처리할 최소 오디오 길이 = 0.5초
+_MIN_BYTES = _PCM_RATE * _PCM_CH * _PCM_WIDTH // 2  # 96,000 bytes
+
+# guild_id → 백그라운드 모니터 Task
+_voice_tasks: dict[int, asyncio.Task] = {}
+
+
+class STTSink(voice_recv.AudioSink):
+    """유저별 PCM을 버퍼링하고 마지막 활동 시각을 기록하는 커스텀 AudioSink."""
+
+    def __init__(self):
+        super().__init__()
+        # uid → {"buf": bytearray, "ts": float}
+        self._user: dict[int, dict] = {}
+
+    def wants_opus(self) -> bool:
+        return False  # 디코딩된 PCM 수신
+
+    def write(self, user, data: voice_recv.VoiceData) -> None:
+        if user is None or not data.pcm:
+            return
+        uid = user.id
+        if uid not in self._user:
+            self._user[uid] = {"buf": bytearray(), "ts": 0.0}
+        self._user[uid]["buf"].extend(data.pcm)
+        self._user[uid]["ts"] = time.monotonic()
+
+    def cleanup(self) -> None:
+        self._user.clear()
+
+    def silent_uids(self, timeout: float) -> list[int]:
+        """`timeout`초 이상 음성이 없는 유저 ID 목록 반환."""
+        cutoff = time.monotonic() - timeout
+        return [uid for uid, d in self._user.items() if d["ts"] <= cutoff]
+
+    def pop_wav(self, uid: int) -> bytes | None:
+        """버퍼를 꺼내 WAV bytes로 반환. 너무 짧거나 노이즈뿐이면 None."""
+        entry = self._user.pop(uid, None)
+        if not entry:
+            return None
+        raw = bytes(entry["buf"])
+        if len(raw) < _MIN_BYTES:
+            print(f"[voice] uid={uid} 버퍼 너무 짧음 ({len(raw)} bytes < {_MIN_BYTES})")
+            return None
+        # RMS 노이즈 게이트
+        if audioop:
+            rms = audioop.rms(raw, _PCM_WIDTH)
+            if rms < VOICE_NOISE_THRESHOLD:
+                print(f"[voice] uid={uid} 노이즈 제거 (RMS={rms} < {VOICE_NOISE_THRESHOLD})")
+                return None
+            print(f"[voice] uid={uid} 오디오 처리 중 (RMS={rms}, {len(raw)//1000}KB)")
+        out = io.BytesIO()
+        with wave.open(out, "wb") as wf:
+            wf.setnchannels(_PCM_CH)
+            wf.setsampwidth(_PCM_WIDTH)
+            wf.setframerate(_PCM_RATE)
+            wf.writeframes(raw)
+        return out.getvalue()
+
+
+async def _voice_join(channel: discord.VoiceChannel) -> None:
+    guild = channel.guild
+    try:
+        sink = STTSink()
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
+        vc.listen(sink)
+        task = asyncio.create_task(_voice_monitor(guild, vc, sink))
+        _voice_tasks[guild.id] = task
+        print(f"[voice] Joined #{channel.name} in {guild.name}")
+    except Exception as e:
+        print(f"[voice] Join error: {e}")
+
+
+async def _voice_leave(guild: discord.Guild) -> None:
+    task = _voice_tasks.pop(guild.id, None)
+    if task:
+        task.cancel()
+    vc = guild.voice_client
+    if vc:
+        if vc.is_listening():
+            vc.stop_listening()
+        await vc.disconnect()
+        print(f"[voice] Left voice in {guild.name}")
+
+
+async def _voice_monitor(
+    guild: discord.Guild, vc: discord.VoiceClient, sink: STTSink
+) -> None:
+    """백그라운드 Task: 묵음 유저를 감지해 STT 처리를 위임.
+    router 스레드가 corrupted stream 등으로 죽으면 자동 재청취."""
+    try:
+        while vc.is_connected():
+            await asyncio.sleep(0.3)
+
+            # router 스레드 사망 감지 → 재청취
+            if not vc.is_listening():
+                print("[voice] router 중단 감지 — 재청취 시작")
+                sink._user.clear()
+                try:
+                    vc.listen(sink)
+                except Exception as e:
+                    print(f"[voice] 재청취 실패: {e}")
+                continue
+
+            for uid in sink.silent_uids(VOICE_SILENCE_TIMEOUT):
+                wav = sink.pop_wav(uid)
+                if wav:
+                    member = guild.get_member(uid)
+                    if member:
+                        asyncio.create_task(_handle_stt(guild, member, wav))
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[voice_monitor] {e}")
+
+
+async def _handle_stt(
+    guild: discord.Guild, member: discord.Member, wav: bytes
+) -> None:
+    """Whisper STT → 번역 → 지정 텍스트 채널에 전송."""
+    role_ids = {r.id for r in member.roles}
+    if ROLE_JA in role_ids and ROLE_KO not in role_ids:
+        src = "ja"
+    elif ROLE_KO in role_ids:
+        src = "ko"
+    else:
+        print(f"[STT] {member.display_name}: 역할 없음 (role_ids={role_ids})")
+        return
+
+    print(f"[STT] {member.display_name} ({src}) → Whisper 요청 중...")
+    cfg = LANG_CONFIG[src]
+    try:
+        audio = io.BytesIO(wav)
+        audio.name = "voice.wav"
+        transcript = await openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio,
+            language=src,
+        )
+        text = transcript.text.strip()
+        print(f"[STT] {member.display_name} 인식 결과: {text!r}")
+        if not text:
+            return
+
+        translated = await translate_openai(text, src=src, dest=cfg["dest"])
+        print(f"[STT] 번역 결과: {translated!r}")
+
+        if not VOICE_TEXT_CHANNEL_ID:
+            print("[STT] VOICE_TEXT_CHANNEL_ID가 0 — .env에 채널 ID를 설정하세요")
+            return
+        ch = guild.get_channel(VOICE_TEXT_CHANNEL_ID)
+        if not ch:
+            print(f"[STT] 채널 {VOICE_TEXT_CHANNEL_ID}을 찾을 수 없음")
+            return
+        embed = discord.Embed(color=cfg["color"])
+        embed.set_author(
+            name=member.display_name,
+            icon_url=member.display_avatar.url,
+        )
+        embed.add_field(name="🎙️ 원문", value=text, inline=False)
+        embed.add_field(name=f"{cfg['flag']} 번역", value=translated, inline=False)
+        embed.set_footer(text="🎤 Voice STT · 🤖 Whisper + AI")
+        await ch.send(embed=embed)
+        print(f"[STT] 채널 전송 완료")
+    except Exception as e:
+        print(f"[STT error] {member.display_name}: {e}")
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    if member.bot:
+        return
+
+    guild = member.guild
+    vc: discord.VoiceClient | None = guild.voice_client
+
+    # 유저가 새 채널에 입장 (이동 포함)
+    if after.channel and (not before.channel or before.channel.id != after.channel.id):
+        if vc is None:
+            await _voice_join(after.channel)
+
+    # 봇 채널에 인간이 없으면 퇴장
+    if vc and vc.channel:
+        humans = [m for m in vc.channel.members if not m.bot]
+        if not humans:
+            await _voice_leave(guild)
 
 
 bot.run(TOKEN)
